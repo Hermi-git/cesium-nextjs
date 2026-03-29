@@ -20,6 +20,43 @@ export default function CesiumViewer({ ionToken }) {
   const [showEarthquakes, setShowEarthquakes] = useState(true);
   const [earthquakeDetails, setEarthquakeDetails] = useState(null);
   const [showTraffic, setShowTraffic] = useState(true);
+  const [showDebug, setShowDebug] = useState(false);
+
+  // Lightweight debug stats (updated ~every 500ms, not per-frame).
+  const flightsCountRef = useRef(0);
+  const satellitesCountRef = useRef(0);
+  const earthquakesCountRef = useRef(0);
+  const trafficCarsCountRef = useRef(0);
+  const fpsRef = useRef(0);
+  const fpsCalcRef = useRef({ lastSampleMs: 0, frames: 0, fps: 0 });
+
+  const showDebugRef = useRef(showDebug);
+  useEffect(() => {
+    showDebugRef.current = showDebug;
+  }, [showDebug]);
+
+  const [debugStats, setDebugStats] = useState({
+    fps: 0,
+    flights: 0,
+    satellites: 0,
+    earthquakes: 0,
+    trafficCars: 0,
+  });
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!showDebugRef.current) return;
+      setDebugStats({
+        fps: fpsRef.current,
+        flights: flightsCountRef.current,
+        satellites: satellitesCountRef.current,
+        earthquakes: earthquakesCountRef.current,
+        trafficCars: trafficCarsCountRef.current,
+      });
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, []);
   // Future layers can follow the same pattern:
   // - const [showWeather, setShowWeather] = useState(true);
 
@@ -87,10 +124,8 @@ export default function CesiumViewer({ ionToken }) {
     let intervalId = null;
     let animationFrameId = null;
     let satelliteIntervalId = null;
-    let satelliteAnimationFrameId = null;
     let earthquakeIntervalId = null;
     let trafficIntervalId = null;
-    let trafficAnimationFrameId = null;
     let flightClickHandler = null;
 
     const init = async () => {
@@ -154,6 +189,13 @@ export default function CesiumViewer({ ionToken }) {
 
       // Improves appearance when combining terrain + 3D primitives.
       viewer.scene.globe.depthTestAgainstTerrain = true;
+
+      // Performance-focused defaults (can be revisited per use-case).
+      viewer.scene.fog.enabled = false;
+      viewer.scene.globe.enableLighting = false;
+      if (viewer.scene.postProcessStages?.fxaa) {
+        viewer.scene.postProcessStages.fxaa.enabled = false;
+      }
       console.log("[Cesium] Viewer created and camera set");
 
       // Add OpenStreetMap 3D buildings.
@@ -204,6 +246,7 @@ export default function CesiumViewer({ ionToken }) {
         flightEntitiesById.clear();
         flightMotionById.clear();
         flightMetaById.clear();
+        flightsCountRef.current = 0;
       };
       clearFlightsRef.current = clearFlightEntities;
 
@@ -237,20 +280,9 @@ export default function CesiumViewer({ ionToken }) {
 
       const refreshIntervalMs = 10000;
 
-      // Motion interpolation animation loop (smooth movement).
-      // Uses linear interpolation between successive poll samples.
-      // animationFrameId and flightClickHandler are owned by the effect scope.
-      const animateFlights = () => {
-        if (cancelled || !viewer) return;
-
-        // If flights are hidden, don't animate positions (entities are removed).
-        if (!showFlightsRef.current) {
-          animationFrameId = requestAnimationFrame(animateFlights);
-          return;
-        }
-
-        const nowPerf = performance.now();
-
+      // Animation internals are called by a single global loop (animateAll).
+      const animateFlightsInternal = (nowPerf) => {
+        if (!showFlightsRef.current) return;
         for (const [id, motion] of flightMotionById.entries()) {
           const entity = flightEntitiesById.get(id);
           if (!entity) continue;
@@ -276,8 +308,6 @@ export default function CesiumViewer({ ionToken }) {
           // Rotate to face direction of motion (heading computed at poll time).
           entity.billboard.rotation = motion.headingRad ?? 0;
         }
-
-        animationFrameId = requestAnimationFrame(animateFlights);
       };
 
       const syncFlights = async () => {
@@ -285,8 +315,11 @@ export default function CesiumViewer({ ionToken }) {
         if (!showFlightsRef.current) return;
 
         try {
-          const flights = await fetchFlights();
+          const flightsRaw = await fetchFlights();
           if (cancelled || !viewer) return;
+
+          // Cap entity count for performance.
+          const flights = Array.isArray(flightsRaw) ? flightsRaw.slice(0, 100) : [];
 
           const incomingIds = new Set(flights.map((f) => f.id));
 
@@ -437,6 +470,7 @@ export default function CesiumViewer({ ionToken }) {
             // Update label text if backend changes id text.
             existingEntity.label.text = id;
           }
+          flightsCountRef.current = flightEntitiesById.size;
         } catch (e) {
           // Console log is sufficient for now.
           console.log("[Flights] Failed to sync flights:", e);
@@ -446,9 +480,6 @@ export default function CesiumViewer({ ionToken }) {
       // Initial sync + then periodic refresh.
       await syncFlights();
       intervalId = setInterval(syncFlights, refreshIntervalMs);
-
-      // Start the animation loop.
-      animationFrameId = requestAnimationFrame(animateFlights);
 
       // Expose sync to the UI toggle without reinitializing Cesium.
       syncFlightsRef.current = syncFlights;
@@ -523,18 +554,8 @@ export default function CesiumViewer({ ionToken }) {
           );
       };
 
-      // Animation loop for satellites (decoupled from polling).
-      const animateSatellites = () => {
-        if (cancelled || !viewer) return;
-
-        // Keep animation off when hidden (but polling continues).
-        if (!showSatellitesRef.current) {
-          satelliteAnimationFrameId = requestAnimationFrame(animateSatellites);
-          return;
-        }
-
-        const nowPerf = performance.now();
-
+      const animateSatellitesInternal = (nowPerf) => {
+        if (!showSatellitesRef.current) return;
         for (const [id, motion] of satelliteMotionById.entries()) {
           const entity = satelliteEntitiesById.get(id);
           if (!entity) continue;
@@ -556,8 +577,6 @@ export default function CesiumViewer({ ionToken }) {
           entity.billboard.scale = satelliteAltitudeToScale(altNow);
           entity.billboard.rotation = motion.headingRad ?? 0;
         }
-
-        satelliteAnimationFrameId = requestAnimationFrame(animateSatellites);
       };
 
       const syncSatellites = async () => {
@@ -566,7 +585,8 @@ export default function CesiumViewer({ ionToken }) {
         try {
           const nowPerf = performance.now();
 
-          const results = await fetchSatellites();
+          // Cap entity count for performance.
+          const results = (await fetchSatellites()).slice(0, 20);
 
           for (const sat of results) {
             const id = sat.id;
@@ -667,6 +687,7 @@ export default function CesiumViewer({ ionToken }) {
 
           // If satellite layer is currently hidden, ensure entities stay hidden.
           setSatellitesVisibility(showSatellitesRef.current);
+          satellitesCountRef.current = satelliteEntitiesById.size;
         } catch (e) {
           console.log("[Satellites] Failed to sync satellites:", e);
         }
@@ -675,7 +696,6 @@ export default function CesiumViewer({ ionToken }) {
       // Initial sync + periodic refresh.
       await syncSatellites();
       satelliteIntervalId = setInterval(syncSatellites, SATELLITE_POLL_INTERVAL_MS);
-      satelliteAnimationFrameId = requestAnimationFrame(animateSatellites);
 
       // -------------------------
       // Earthquake layer (static)
@@ -733,7 +753,14 @@ export default function CesiumViewer({ ionToken }) {
         if (cancelled || !viewer) return;
 
         try {
-          const earthquakes = await fetchEarthquakes();
+          const earthquakesRaw = await fetchEarthquakes();
+          // Cap entity count (recent first) for performance.
+          const earthquakes = Array.isArray(earthquakesRaw)
+            ? earthquakesRaw
+                .slice()
+                .sort((a, b) => b.time - a.time)
+                .slice(0, 50)
+            : [];
 
           const incomingKeys = new Set(earthquakes.map((e) => `eq-${e.id}`));
 
@@ -790,6 +817,7 @@ export default function CesiumViewer({ ionToken }) {
 
           // Respect layer visibility after update.
           setEarthquakesVisibility(showEarthquakesRef.current);
+          earthquakesCountRef.current = earthquakeEntitiesById.size;
         } catch (e) {
           console.log("[Earthquakes] Failed to sync earthquakes:", e);
         }
@@ -970,36 +998,67 @@ export default function CesiumViewer({ ionToken }) {
           }
 
           setTrafficVisibility(showTrafficRef.current);
+          trafficCarsCountRef.current = trafficEntitiesById.size;
         } catch (e) {
           console.log("[Traffic] Failed to sync traffic roads:", e);
         }
       };
 
-      let trafficLastFramePerf = performance.now();
-      const animateTraffic = () => {
-        if (cancelled || !viewer) return;
+      const animateTrafficInternal = (dtSec) => {
+        if (!showTrafficRef.current) return;
+        for (const [carId, motion] of trafficMotionById.entries()) {
+          const entity = trafficEntitiesById.get(carId);
+          if (!entity) continue;
 
-        const nowPerf = performance.now();
-        const dtSec = Math.min(0.1, Math.max(0, (nowPerf - trafficLastFramePerf) / 1000));
-        trafficLastFramePerf = nowPerf;
-
-        if (showTrafficRef.current) {
-          for (const [carId, motion] of trafficMotionById.entries()) {
-            const entity = trafficEntitiesById.get(carId);
-            if (!entity) continue;
-
-            motion.distance += motion.speedMps * dtSec;
-            samplePositionOnPath(motion, motion.distance, motion.scratchPos);
-            entity.position = motion.scratchPos;
-          }
+          motion.distance += motion.speedMps * dtSec;
+          samplePositionOnPath(motion, motion.distance, motion.scratchPos);
+          entity.position = motion.scratchPos;
         }
-
-        trafficAnimationFrameId = requestAnimationFrame(animateTraffic);
       };
 
       await syncTraffic();
       trafficIntervalId = setInterval(syncTraffic, TRAFFIC_POLL_INTERVAL_MS);
-      trafficAnimationFrameId = requestAnimationFrame(animateTraffic);
+
+      // -------------------------
+      // Global animation loop
+      // -------------------------
+      // Single rAF for all layers with optional ~30 FPS throttling.
+      const targetFrameMs = 33; // ~30fps
+      let lastFrameTime = 0;
+      let lastTrafficTime = 0;
+
+      const animateAll = (time) => {
+        if (cancelled || !viewer) return;
+
+        // Schedule next frame first to keep animation stable even if work below throws.
+        animationFrameId = requestAnimationFrame(animateAll);
+
+        // FPS calculation (lightweight): update approx once per second.
+        fpsCalcRef.current.frames += 1;
+        if (!fpsCalcRef.current.lastSampleMs) fpsCalcRef.current.lastSampleMs = time;
+        const elapsedMs = time - fpsCalcRef.current.lastSampleMs;
+        if (elapsedMs >= 1000) {
+          const fps = Math.round((fpsCalcRef.current.frames * 1000) / elapsedMs);
+          fpsCalcRef.current.fps = fps;
+          fpsRef.current = fps;
+          fpsCalcRef.current.frames = 0;
+          fpsCalcRef.current.lastSampleMs = time;
+        }
+
+        if (lastFrameTime && time - lastFrameTime < targetFrameMs) return;
+        lastFrameTime = time;
+
+        // Flights + satellites use "time" (ms) for interpolation between polls.
+        animateFlightsInternal(time);
+        animateSatellitesInternal(time);
+
+        // Traffic needs dt.
+        const dtSec = Math.min(0.1, Math.max(0, (time - (lastTrafficTime || time)) / 1000));
+        lastTrafficTime = time;
+        animateTrafficInternal(dtSec);
+      };
+
+      animationFrameId = requestAnimationFrame(animateAll);
 
       // Click-to-inspect flight OR satellite OR earthquake details.
       // We read current interpolated altitude from motion at click time.
@@ -1119,12 +1178,6 @@ export default function CesiumViewer({ ionToken }) {
       }
 
       try {
-        if (satelliteAnimationFrameId) cancelAnimationFrame(satelliteAnimationFrameId);
-      } catch {
-        // ignore
-      }
-
-      try {
         if (earthquakeIntervalId) clearInterval(earthquakeIntervalId);
       } catch {
         // ignore
@@ -1132,12 +1185,6 @@ export default function CesiumViewer({ ionToken }) {
 
       try {
         if (trafficIntervalId) clearInterval(trafficIntervalId);
-      } catch {
-        // ignore
-      }
-
-      try {
-        if (trafficAnimationFrameId) cancelAnimationFrame(trafficAnimationFrameId);
       } catch {
         // ignore
       }
@@ -1230,7 +1277,57 @@ export default function CesiumViewer({ ionToken }) {
           />
           <span>Show Traffic</span>
         </label>
+
+        <div style={{ height: 10 }} />
+
+        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={showDebug}
+            onChange={(e) => setShowDebug(e.target.checked)}
+            style={{ accentColor: "#a78bfa" }}
+          />
+          <span>Show Debug</span>
+        </label>
       </div>
+
+      {/* Debug stats panel */}
+      {showDebug && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 20,
+            left: 20,
+            zIndex: 10,
+            background: "rgba(0, 0, 0, 0.6)",
+            color: "white",
+            padding: "10px 12px",
+            borderRadius: 8,
+            fontFamily: "Arial, Helvetica, sans-serif",
+            fontSize: 12,
+            lineHeight: "18px",
+            userSelect: "none",
+            minWidth: 190,
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Debug</div>
+          <div>
+            <b>FPS:</b> {debugStats.fps}
+          </div>
+          <div>
+            <b>Flights:</b> {debugStats.flights}
+          </div>
+          <div>
+            <b>Satellites:</b> {debugStats.satellites}
+          </div>
+          <div>
+            <b>Earthquakes:</b> {debugStats.earthquakes}
+          </div>
+          <div>
+            <b>Traffic cars:</b> {debugStats.trafficCars}
+          </div>
+        </div>
+      )}
 
       {/* Flight details panel (click-to-inspect) */}
       {flightDetails && (

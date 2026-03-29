@@ -20,6 +20,7 @@ export default function CesiumViewer({ ionToken }) {
   const [showEarthquakes, setShowEarthquakes] = useState(true);
   const [earthquakeDetails, setEarthquakeDetails] = useState(null);
   const [showTraffic, setShowTraffic] = useState(true);
+  const [trafficDetails, setTrafficDetails] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
 
   // Lightweight debug stats (updated ~every 500ms, not per-frame).
@@ -114,6 +115,7 @@ export default function CesiumViewer({ ionToken }) {
   const setTrafficVisibilityRef = useRef(null);
   useEffect(() => {
     setTrafficVisibilityRef.current?.(showTraffic);
+    setTrafficDetails(null);
   }, [showTraffic]);
 
   useEffect(() => {
@@ -831,6 +833,19 @@ export default function CesiumViewer({ ionToken }) {
       // -------------------------
       const trafficEntitiesById = new Map();
       const trafficMotionById = new Map();
+      const trafficMetaById = new Map();
+
+      // Small car icon (white) as inline SVG data URL (billboard).
+      const CAR_ICON_URL =
+        "data:image/svg+xml;charset=utf-8," +
+        encodeURIComponent(`
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+            <path fill="white" d="M14 36l4-14c1-4 4-6 8-6h12c4 0 7 2 8 6l4 14v12c0 2-2 4-4 4h-2c-2 0-4-2-4-4v-2H22v2c0 2-2 4-4 4h-2c-2 0-4-2-4-4V36z"/>
+            <path fill="white" opacity="0.25" d="M22 20h20c2 0 4 1 4 3l2 7H20l2-7c0-2 2-3 4-3z"/>
+            <circle cx="22" cy="40" r="4" fill="black"/>
+            <circle cx="42" cy="40" r="4" fill="black"/>
+          </svg>
+        `);
 
       const setTrafficVisibility = (visible) => {
         for (const entity of trafficEntitiesById.values()) {
@@ -962,25 +977,43 @@ export default function CesiumViewer({ ionToken }) {
                   new Cesium.Cartesian3()
                 );
 
+                // Slight scaling based on speed.
+                const scale = Math.max(0.8, Math.min(1.3, 0.9 + speedMps / 30));
+
                 const entity = viewer.entities.add({
                   id: carId,
                   position: startPos,
                   show: showTrafficRef.current,
-                  point: {
-                    pixelSize: 5,
-                    color: Cesium.Color.CYAN,
-                    outlineColor: Cesium.Color.BLACK,
-                    outlineWidth: 1,
+                  billboard: {
+                    image: CAR_ICON_URL,
+                    width: 20,
+                    height: 20,
+                    scale,
+                    color: Cesium.Color.WHITE,
                     heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
                     disableDepthTestDistance: 5000,
                   },
                 });
                 trafficEntitiesById.set(carId, entity);
               } else {
                 existingEntity.show = showTrafficRef.current;
+                // Keep a consistent scale if speed changes later.
+                if (existingEntity.billboard) {
+                  existingEntity.billboard.scale = Math.max(
+                    0.8,
+                    Math.min(1.3, 0.9 + speedMps / 30)
+                  );
+                }
               }
 
               trafficMotionById.set(carId, newMotion);
+
+              trafficMetaById.set(carId, {
+                vehicleId: carId,
+                roadId: road.id,
+                speedMps,
+              });
             }
           }
 
@@ -994,6 +1027,7 @@ export default function CesiumViewer({ ionToken }) {
               }
               trafficEntitiesById.delete(carId);
               trafficMotionById.delete(carId);
+              trafficMetaById.delete(carId);
             }
           }
 
@@ -1013,6 +1047,25 @@ export default function CesiumViewer({ ionToken }) {
           motion.distance += motion.speedMps * dtSec;
           samplePositionOnPath(motion, motion.distance, motion.scratchPos);
           entity.position = motion.scratchPos;
+
+          // Rotate car to face direction of motion (approx from a small forward sample).
+          if (entity.billboard) {
+            const aheadPos = new Cesium.Cartesian3();
+            samplePositionOnPath(motion, motion.distance + 5, aheadPos);
+            const heading = Cesium.Math.headingPitchRollToFixedFrame
+              ? 0
+              : 0;
+            // Simpler: derive heading via ENU frame.
+            // Compute heading from current->ahead in local tangent plane.
+            try {
+              const enu = Cesium.Transforms.eastNorthUpToFixedFrame(motion.scratchPos);
+              const inv = Cesium.Matrix4.inverse(enu, new Cesium.Matrix4());
+              const localAhead = Cesium.Matrix4.multiplyByPoint(inv, aheadPos, new Cesium.Cartesian3());
+              entity.billboard.rotation = Math.atan2(localAhead.x, localAhead.y);
+            } catch {
+              // ignore rotation issues
+            }
+          }
         }
       };
 
@@ -1072,6 +1125,7 @@ export default function CesiumViewer({ ionToken }) {
             setFlightDetails(null);
             setSatelliteDetails(null);
             setEarthquakeDetails(null);
+            setTrafficDetails(null);
             return;
           }
 
@@ -1097,6 +1151,7 @@ export default function CesiumViewer({ ionToken }) {
             });
             setSatelliteDetails(null);
             setEarthquakeDetails(null);
+            setTrafficDetails(null);
             return;
           }
 
@@ -1120,6 +1175,7 @@ export default function CesiumViewer({ ionToken }) {
             });
             setFlightDetails(null);
             setEarthquakeDetails(null);
+            setTrafficDetails(null);
             return;
           }
 
@@ -1134,12 +1190,40 @@ export default function CesiumViewer({ ionToken }) {
             });
             setFlightDetails(null);
             setSatelliteDetails(null);
+            setTrafficDetails(null);
             return;
+          }
+
+          // Otherwise, if it's traffic, treat it as traffic.
+          if (typeof id === "string" && id.startsWith("traffic-")) {
+            const meta = trafficMetaById.get(id);
+            const motion = trafficMotionById.get(id);
+            if (meta && motion) {
+              const progress =
+                motion.totalLength > 0
+                  ? (Math.max(0, motion.distance % motion.totalLength) /
+                      motion.totalLength) *
+                    100
+                  : 0;
+
+              setTrafficDetails({
+                vehicleId: meta.vehicleId,
+                roadId: meta.roadId,
+                speedMps: meta.speedMps,
+                speedKmh: meta.speedMps * 3.6,
+                progressPct: progress,
+              });
+              setFlightDetails(null);
+              setSatelliteDetails(null);
+              setEarthquakeDetails(null);
+              return;
+            }
           }
 
           setFlightDetails(null);
           setSatelliteDetails(null);
           setEarthquakeDetails(null);
+          setTrafficDetails(null);
         } catch {
           // ignore click failures
         }
@@ -1224,15 +1308,27 @@ export default function CesiumViewer({ ionToken }) {
           zIndex: 10,
           background: "rgba(0, 0, 0, 0.6)",
           color: "white",
-          padding: "12px 14px",
-          borderRadius: 8,
+          padding: "12px",
+          borderRadius: 10,
+          boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
           fontFamily: "Arial, Helvetica, sans-serif",
           userSelect: "none",
         }}
       >
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Layers</div>
 
-        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <label
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            padding: "6px 8px",
+            borderRadius: 8,
+            cursor: "pointer",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.08)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
           <input
             type="checkbox"
             checked={showFlights}
@@ -1242,9 +1338,18 @@ export default function CesiumViewer({ ionToken }) {
           <span>Show Flights</span>
         </label>
 
-        <div style={{ height: 10 }} />
-
-        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <label
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            padding: "6px 8px",
+            borderRadius: 8,
+            cursor: "pointer",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.08)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
           <input
             type="checkbox"
             checked={showSatellites}
@@ -1254,9 +1359,18 @@ export default function CesiumViewer({ ionToken }) {
           <span>Show Satellites</span>
         </label>
 
-        <div style={{ height: 10 }} />
-
-        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <label
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            padding: "6px 8px",
+            borderRadius: 8,
+            cursor: "pointer",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.08)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
           <input
             type="checkbox"
             checked={showEarthquakes}
@@ -1266,9 +1380,35 @@ export default function CesiumViewer({ ionToken }) {
           <span>Show Earthquakes</span>
         </label>
 
-        <div style={{ height: 10 }} />
+        {/* Earthquake legend */}
+        <div style={{ padding: "6px 8px 2px 8px", fontSize: 12, opacity: 0.9 }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>Quake legend</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 2 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 99, background: "#facc15", display: "inline-block" }} />
+            <span>Mag &lt; 4</span>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 2 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 99, background: "#fb923c", display: "inline-block" }} />
+            <span>Mag 4–6</span>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <span style={{ width: 10, height: 10, borderRadius: 99, background: "#ef4444", display: "inline-block" }} />
+            <span>Mag &gt; 6</span>
+          </div>
+        </div>
 
-        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <label
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            padding: "6px 8px",
+            borderRadius: 8,
+            cursor: "pointer",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.08)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
           <input
             type="checkbox"
             checked={showTraffic}
@@ -1278,9 +1418,18 @@ export default function CesiumViewer({ ionToken }) {
           <span>Show Traffic</span>
         </label>
 
-        <div style={{ height: 10 }} />
-
-        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <label
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            padding: "6px 8px",
+            borderRadius: 8,
+            cursor: "pointer",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.08)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
           <input
             type="checkbox"
             checked={showDebug}
@@ -1339,8 +1488,9 @@ export default function CesiumViewer({ ionToken }) {
             zIndex: 10,
             background: "rgba(0, 0, 0, 0.6)",
             color: "white",
-            padding: "12px 14px",
-            borderRadius: 8,
+            padding: "12px",
+            borderRadius: 10,
+            boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
             fontFamily: "Arial, Helvetica, sans-serif",
             userSelect: "none",
             minWidth: 200,
@@ -1369,8 +1519,9 @@ export default function CesiumViewer({ ionToken }) {
             zIndex: 10,
             background: "rgba(0, 0, 0, 0.6)",
             color: "white",
-            padding: "12px 14px",
-            borderRadius: 8,
+            padding: "12px",
+            borderRadius: 10,
+            boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
             fontFamily: "Arial, Helvetica, sans-serif",
             userSelect: "none",
             minWidth: 220,
@@ -1404,8 +1555,9 @@ export default function CesiumViewer({ ionToken }) {
             zIndex: 10,
             background: "rgba(0, 0, 0, 0.6)",
             color: "white",
-            padding: "12px 14px",
-            borderRadius: 8,
+            padding: "12px",
+            borderRadius: 10,
+            boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
             fontFamily: "Arial, Helvetica, sans-serif",
             userSelect: "none",
             minWidth: 280,
@@ -1420,6 +1572,41 @@ export default function CesiumViewer({ ionToken }) {
           </div>
           <div style={{ fontSize: 13 }}>
             <b>Time:</b> {new Date(earthquakeDetails.time).toLocaleString()}
+          </div>
+        </div>
+      )}
+
+      {/* Traffic details panel (click-to-inspect) */}
+      {trafficDetails && (
+        <div
+          style={{
+            position: "absolute",
+            top: 250,
+            left: 320,
+            zIndex: 10,
+            background: "rgba(0, 0, 0, 0.6)",
+            color: "white",
+            padding: "12px",
+            borderRadius: 10,
+            boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+            fontFamily: "Arial, Helvetica, sans-serif",
+            userSelect: "none",
+            minWidth: 260,
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>Traffic</div>
+          <div style={{ fontSize: 13, marginBottom: 4 }}>
+            <b>Vehicle ID:</b> {trafficDetails.vehicleId}
+          </div>
+          <div style={{ fontSize: 13, marginBottom: 4 }}>
+            <b>Road ID:</b> {trafficDetails.roadId}
+          </div>
+          <div style={{ fontSize: 13, marginBottom: 4 }}>
+            <b>Speed:</b> {Math.round(trafficDetails.speedMps)} m/s (
+            {Math.round(trafficDetails.speedKmh)} km/h)
+          </div>
+          <div style={{ fontSize: 13 }}>
+            <b>Progress:</b> {trafficDetails.progressPct.toFixed(1)}%
           </div>
         </div>
       )}

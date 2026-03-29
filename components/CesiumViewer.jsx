@@ -17,6 +17,9 @@ export default function CesiumViewer({ ionToken }) {
   const [flightDetails, setFlightDetails] = useState(null);
   const [showSatellites, setShowSatellites] = useState(true);
   const [satelliteDetails, setSatelliteDetails] = useState(null);
+  const [showEarthquakes, setShowEarthquakes] = useState(true);
+  const [earthquakeDetails, setEarthquakeDetails] = useState(null);
+  const [showTraffic, setShowTraffic] = useState(true);
   // Future layers can follow the same pattern:
   // - const [showWeather, setShowWeather] = useState(true);
 
@@ -53,6 +56,29 @@ export default function CesiumViewer({ ionToken }) {
     setSatellitesVisibilityRef.current?.(showSatellites);
   }, [showSatellites]);
 
+  // Earthquake visibility toggle (static points layer).
+  const showEarthquakesRef = useRef(showEarthquakes);
+  useEffect(() => {
+    showEarthquakesRef.current = showEarthquakes;
+  }, [showEarthquakes]);
+
+  const setEarthquakesVisibilityRef = useRef(null);
+  useEffect(() => {
+    setEarthquakeDetails(null);
+    setEarthquakesVisibilityRef.current?.(showEarthquakes);
+  }, [showEarthquakes]);
+
+  // Traffic visibility toggle (simulated cars on OSM roads).
+  const showTrafficRef = useRef(showTraffic);
+  useEffect(() => {
+    showTrafficRef.current = showTraffic;
+  }, [showTraffic]);
+
+  const setTrafficVisibilityRef = useRef(null);
+  useEffect(() => {
+    setTrafficVisibilityRef.current?.(showTraffic);
+  }, [showTraffic]);
+
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -62,6 +88,7 @@ export default function CesiumViewer({ ionToken }) {
     let animationFrameId = null;
     let satelliteIntervalId = null;
     let satelliteAnimationFrameId = null;
+    let earthquakeIntervalId = null;
     let flightClickHandler = null;
 
     const init = async () => {
@@ -648,7 +675,128 @@ export default function CesiumViewer({ ionToken }) {
       satelliteIntervalId = setInterval(syncSatellites, SATELLITE_POLL_INTERVAL_MS);
       satelliteAnimationFrameId = requestAnimationFrame(animateSatellites);
 
-      // Click-to-inspect flight OR satellite details.
+      // -------------------------
+      // Earthquake layer (static)
+      // -------------------------
+      const earthquakeEntitiesById = new Map();
+      const earthquakeMetaById = new Map();
+      const EARTHQUAKE_POLL_INTERVAL_MS = refreshIntervalMs;
+
+      const setEarthquakesVisibility = (visible) => {
+        for (const entity of earthquakeEntitiesById.values()) {
+          try {
+            entity.show = visible;
+          } catch {
+            // ignore
+          }
+        }
+      };
+      setEarthquakesVisibilityRef.current = setEarthquakesVisibility;
+      setEarthquakesVisibility(showEarthquakesRef.current);
+
+      const magnitudeToColor = (magnitude) => {
+        if (magnitude >= 5) return Cesium.Color.RED;
+        if (magnitude >= 3.5) return Cesium.Color.ORANGE;
+        return Cesium.Color.YELLOW;
+      };
+
+      const magnitudeToSize = (magnitude) =>
+        Math.max(5, Math.min(18, 4 + magnitude * 2));
+
+      const fetchEarthquakes = async () => {
+        const res = await fetch("/api/earthquakes", { cache: "no-store" });
+        if (!res.ok) return [];
+        const data = await res.json();
+        if (!Array.isArray(data)) return [];
+        return data
+          .map((e) => ({
+            id: String(e?.id ?? ""),
+            lat: Number(e?.lat),
+            lon: Number(e?.lon),
+            magnitude: Number(e?.magnitude),
+            place: typeof e?.place === "string" ? e.place : "",
+            time: Number(e?.time),
+          }))
+          .filter(
+            (e) =>
+              e.id &&
+              Number.isFinite(e.lat) &&
+              Number.isFinite(e.lon) &&
+              Number.isFinite(e.magnitude) &&
+              Number.isFinite(e.time)
+          );
+      };
+
+      const syncEarthquakes = async () => {
+        if (cancelled || !viewer) return;
+
+        try {
+          const earthquakes = await fetchEarthquakes();
+
+          const incomingKeys = new Set(earthquakes.map((e) => `eq-${e.id}`));
+
+          // Remove earthquakes that disappeared from the feed.
+          for (const [entityKey, entity] of earthquakeEntitiesById.entries()) {
+            if (!incomingKeys.has(entityKey)) {
+              try {
+                viewer.entities.remove(entity);
+              } catch {
+                // ignore
+              }
+              earthquakeEntitiesById.delete(entityKey);
+              earthquakeMetaById.delete(entityKey);
+            }
+          }
+
+          for (const eq of earthquakes) {
+            const entityKey = `eq-${eq.id}`;
+
+            const position = Cesium.Cartesian3.fromDegrees(eq.lon, eq.lat, 0);
+            const pixelSize = magnitudeToSize(eq.magnitude);
+            const color = magnitudeToColor(eq.magnitude);
+
+            const existingEntity = earthquakeEntitiesById.get(entityKey);
+            if (!existingEntity) {
+              const entity = viewer.entities.add({
+                id: entityKey,
+                position,
+                show: showEarthquakesRef.current,
+                point: {
+                  pixelSize,
+                  color,
+                  outlineColor: Cesium.Color.BLACK,
+                  outlineWidth: 1,
+                  heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                  disableDepthTestDistance: 5000,
+                },
+              });
+              earthquakeEntitiesById.set(entityKey, entity);
+            } else {
+              existingEntity.position = position;
+              existingEntity.point.pixelSize = pixelSize;
+              existingEntity.point.color = color;
+              existingEntity.show = showEarthquakesRef.current;
+            }
+
+            earthquakeMetaById.set(entityKey, {
+              id: eq.id,
+              magnitude: eq.magnitude,
+              place: eq.place,
+              time: eq.time,
+            });
+          }
+
+          // Respect layer visibility after update.
+          setEarthquakesVisibility(showEarthquakesRef.current);
+        } catch (e) {
+          console.log("[Earthquakes] Failed to sync earthquakes:", e);
+        }
+      };
+
+      await syncEarthquakes();
+      earthquakeIntervalId = setInterval(syncEarthquakes, EARTHQUAKE_POLL_INTERVAL_MS);
+
+      // Click-to-inspect flight OR satellite OR earthquake details.
       // We read current interpolated altitude from motion at click time.
       const handler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
       handler.setInputAction((movement) => {
@@ -659,6 +807,7 @@ export default function CesiumViewer({ ionToken }) {
           if (!id) {
             setFlightDetails(null);
             setSatelliteDetails(null);
+            setEarthquakeDetails(null);
             return;
           }
 
@@ -683,6 +832,7 @@ export default function CesiumViewer({ ionToken }) {
               speedKmh,
             });
             setSatelliteDetails(null);
+            setEarthquakeDetails(null);
             return;
           }
 
@@ -705,11 +855,27 @@ export default function CesiumViewer({ ionToken }) {
               velocityKmh: satMeta.velocityKmh ?? 0,
             });
             setFlightDetails(null);
+            setEarthquakeDetails(null);
+            return;
+          }
+
+          // Otherwise, if it's an earthquake, treat it as an earthquake.
+          const eqMeta = earthquakeMetaById.get(id);
+          if (eqMeta) {
+            setEarthquakeDetails({
+              id: eqMeta.id,
+              magnitude: eqMeta.magnitude,
+              place: eqMeta.place,
+              time: eqMeta.time,
+            });
+            setFlightDetails(null);
+            setSatelliteDetails(null);
             return;
           }
 
           setFlightDetails(null);
           setSatelliteDetails(null);
+          setEarthquakeDetails(null);
         } catch {
           // ignore click failures
         }
@@ -749,6 +915,12 @@ export default function CesiumViewer({ ionToken }) {
 
       try {
         if (satelliteAnimationFrameId) cancelAnimationFrame(satelliteAnimationFrameId);
+      } catch {
+        // ignore
+      }
+
+      try {
+        if (earthquakeIntervalId) clearInterval(earthquakeIntervalId);
       } catch {
         // ignore
       }
@@ -817,6 +989,18 @@ export default function CesiumViewer({ ionToken }) {
           />
           <span>Show Satellites</span>
         </label>
+
+        <div style={{ height: 10 }} />
+
+        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={showEarthquakes}
+            onChange={(e) => setShowEarthquakes(e.target.checked)}
+            style={{ accentColor: "#22d3ee" }}
+          />
+          <span>Show Earthquakes</span>
+        </label>
       </div>
 
       {/* Flight details panel (click-to-inspect) */}
@@ -880,6 +1064,36 @@ export default function CesiumViewer({ ionToken }) {
           </div>
           <div style={{ fontSize: 13 }}>
             <b>Velocity:</b> {Math.round(satelliteDetails.velocityKmh)} km/h
+          </div>
+        </div>
+      )}
+
+      {/* Earthquake details panel (click-to-inspect) */}
+      {earthquakeDetails && (
+        <div
+          style={{
+            position: "absolute",
+            top: 250,
+            left: 20,
+            zIndex: 10,
+            background: "rgba(0, 0, 0, 0.6)",
+            color: "white",
+            padding: "12px 14px",
+            borderRadius: 8,
+            fontFamily: "Arial, Helvetica, sans-serif",
+            userSelect: "none",
+            minWidth: 280,
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>Earthquake</div>
+          <div style={{ fontSize: 13, marginBottom: 4 }}>
+            <b>Magnitude:</b> {earthquakeDetails.magnitude.toFixed(1)}
+          </div>
+          <div style={{ fontSize: 13, marginBottom: 4 }}>
+            <b>Location:</b> {earthquakeDetails.place || "Unknown"}
+          </div>
+          <div style={{ fontSize: 13 }}>
+            <b>Time:</b> {new Date(earthquakeDetails.time).toLocaleString()}
           </div>
         </div>
       )}

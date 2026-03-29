@@ -89,6 +89,8 @@ export default function CesiumViewer({ ionToken }) {
     let satelliteIntervalId = null;
     let satelliteAnimationFrameId = null;
     let earthquakeIntervalId = null;
+    let trafficIntervalId = null;
+    let trafficAnimationFrameId = null;
     let flightClickHandler = null;
 
     const init = async () => {
@@ -796,6 +798,209 @@ export default function CesiumViewer({ ionToken }) {
       await syncEarthquakes();
       earthquakeIntervalId = setInterval(syncEarthquakes, EARTHQUAKE_POLL_INTERVAL_MS);
 
+      // -------------------------
+      // Traffic layer (simulated cars on OSM roads)
+      // -------------------------
+      const trafficEntitiesById = new Map();
+      const trafficMotionById = new Map();
+
+      const setTrafficVisibility = (visible) => {
+        for (const entity of trafficEntitiesById.values()) {
+          try {
+            entity.show = visible;
+          } catch {
+            // ignore
+          }
+        }
+      };
+      setTrafficVisibilityRef.current = setTrafficVisibility;
+      setTrafficVisibility(showTrafficRef.current);
+
+      const fetchTrafficRoads = async () => {
+        const res = await fetch("/api/traffic", { cache: "no-store" });
+        if (!res.ok) return [];
+        const data = await res.json();
+        if (!Array.isArray(data)) return [];
+
+        return data
+          .map((road) => ({
+            id: String(road?.id ?? ""),
+            path: Array.isArray(road?.path) ? road.path : [],
+          }))
+          .filter(
+            (road) =>
+              road.id &&
+              road.path.length >= 2 &&
+              road.path.every(
+                (p) =>
+                  Array.isArray(p) &&
+                  p.length === 2 &&
+                  Number.isFinite(Number(p[0])) &&
+                  Number.isFinite(Number(p[1]))
+              )
+          );
+      };
+
+      const computePathMotion = (pathLonLat) => {
+        const cartesianPath = pathLonLat.map(([lon, lat]) =>
+          Cesium.Cartesian3.fromDegrees(Number(lon), Number(lat), 0)
+        );
+
+        const segmentLengths = [];
+        let totalLength = 0;
+        for (let i = 0; i < cartesianPath.length - 1; i += 1) {
+          const segLen = Cesium.Cartesian3.distance(cartesianPath[i], cartesianPath[i + 1]);
+          segmentLengths.push(segLen);
+          totalLength += segLen;
+        }
+
+        return { cartesianPath, segmentLengths, totalLength };
+      };
+
+      const samplePositionOnPath = (motion, distanceAlongPath, result) => {
+        const { cartesianPath, segmentLengths, totalLength } = motion;
+        if (!cartesianPath.length) return result;
+        if (cartesianPath.length === 1 || totalLength <= 0) {
+          return Cesium.Cartesian3.clone(cartesianPath[0], result);
+        }
+
+        let d = distanceAlongPath % totalLength;
+        if (d < 0) d += totalLength;
+
+        for (let i = 0; i < segmentLengths.length; i += 1) {
+          const segLen = segmentLengths[i];
+          if (d <= segLen || i === segmentLengths.length - 1) {
+            const t = segLen > 0 ? d / segLen : 0;
+            return Cesium.Cartesian3.lerp(cartesianPath[i], cartesianPath[i + 1], t, result);
+          }
+          d -= segLen;
+        }
+
+        return Cesium.Cartesian3.clone(cartesianPath[cartesianPath.length - 1], result);
+      };
+
+      const carsPerRoad = (roadId) => {
+        // Deterministic 1-3 cars per road.
+        let h = 0;
+        for (let i = 0; i < roadId.length; i += 1) {
+          h = (h * 31 + roadId.charCodeAt(i)) % 9973;
+        }
+        return (h % 3) + 1;
+      };
+
+      const TRAFFIC_POLL_INTERVAL_MS = 30000;
+      const MAX_ROADS_FOR_SIM = 30;
+
+      const syncTraffic = async () => {
+        if (cancelled || !viewer) return;
+
+        try {
+          const roads = await fetchTrafficRoads();
+          const selectedRoads = roads.slice(0, MAX_ROADS_FOR_SIM);
+
+          const activeCarIds = new Set();
+
+          for (const road of selectedRoads) {
+            const pathLonLat = road.path;
+            const pathData = computePathMotion(pathLonLat);
+            if (pathData.totalLength <= 1) continue;
+
+            const carCount = carsPerRoad(road.id);
+
+            for (let carIdx = 0; carIdx < carCount; carIdx += 1) {
+              const carId = `traffic-${road.id}-${carIdx}`;
+              activeCarIds.add(carId);
+
+              const existingEntity = trafficEntitiesById.get(carId);
+              const existingMotion = trafficMotionById.get(carId);
+
+              const speedMps = 8 + carIdx * 3; // small variation per road
+              const initialDistance = (carIdx / carCount) * pathData.totalLength;
+
+              const newMotion = {
+                roadId: road.id,
+                cartesianPath: pathData.cartesianPath,
+                segmentLengths: pathData.segmentLengths,
+                totalLength: pathData.totalLength,
+                speedMps,
+                distance: existingMotion?.distance ?? initialDistance,
+                scratchPos: existingMotion?.scratchPos ?? new Cesium.Cartesian3(),
+              };
+
+              if (!existingEntity) {
+                const startPos = samplePositionOnPath(
+                  newMotion,
+                  newMotion.distance,
+                  new Cesium.Cartesian3()
+                );
+
+                const entity = viewer.entities.add({
+                  id: carId,
+                  position: startPos,
+                  show: showTrafficRef.current,
+                  point: {
+                    pixelSize: 5,
+                    color: Cesium.Color.CYAN,
+                    outlineColor: Cesium.Color.BLACK,
+                    outlineWidth: 1,
+                    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    disableDepthTestDistance: 5000,
+                  },
+                });
+                trafficEntitiesById.set(carId, entity);
+              } else {
+                existingEntity.show = showTrafficRef.current;
+              }
+
+              trafficMotionById.set(carId, newMotion);
+            }
+          }
+
+          // Remove cars that no longer belong to active roads.
+          for (const [carId, entity] of trafficEntitiesById.entries()) {
+            if (!activeCarIds.has(carId)) {
+              try {
+                viewer.entities.remove(entity);
+              } catch {
+                // ignore
+              }
+              trafficEntitiesById.delete(carId);
+              trafficMotionById.delete(carId);
+            }
+          }
+
+          setTrafficVisibility(showTrafficRef.current);
+        } catch (e) {
+          console.log("[Traffic] Failed to sync traffic roads:", e);
+        }
+      };
+
+      let trafficLastFramePerf = performance.now();
+      const animateTraffic = () => {
+        if (cancelled || !viewer) return;
+
+        const nowPerf = performance.now();
+        const dtSec = Math.min(0.1, Math.max(0, (nowPerf - trafficLastFramePerf) / 1000));
+        trafficLastFramePerf = nowPerf;
+
+        if (showTrafficRef.current) {
+          for (const [carId, motion] of trafficMotionById.entries()) {
+            const entity = trafficEntitiesById.get(carId);
+            if (!entity) continue;
+
+            motion.distance += motion.speedMps * dtSec;
+            samplePositionOnPath(motion, motion.distance, motion.scratchPos);
+            entity.position = motion.scratchPos;
+          }
+        }
+
+        trafficAnimationFrameId = requestAnimationFrame(animateTraffic);
+      };
+
+      await syncTraffic();
+      trafficIntervalId = setInterval(syncTraffic, TRAFFIC_POLL_INTERVAL_MS);
+      trafficAnimationFrameId = requestAnimationFrame(animateTraffic);
+
       // Click-to-inspect flight OR satellite OR earthquake details.
       // We read current interpolated altitude from motion at click time.
       const handler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
@@ -926,6 +1131,18 @@ export default function CesiumViewer({ ionToken }) {
       }
 
       try {
+        if (trafficIntervalId) clearInterval(trafficIntervalId);
+      } catch {
+        // ignore
+      }
+
+      try {
+        if (trafficAnimationFrameId) cancelAnimationFrame(trafficAnimationFrameId);
+      } catch {
+        // ignore
+      }
+
+      try {
         flightClickHandler?.destroy();
       } catch {
         // ignore
@@ -1000,6 +1217,18 @@ export default function CesiumViewer({ ionToken }) {
             style={{ accentColor: "#22d3ee" }}
           />
           <span>Show Earthquakes</span>
+        </label>
+
+        <div style={{ height: 10 }} />
+
+        <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={showTraffic}
+            onChange={(e) => setShowTraffic(e.target.checked)}
+            style={{ accentColor: "#22d3ee" }}
+          />
+          <span>Show Traffic</span>
         </label>
       </div>
 
